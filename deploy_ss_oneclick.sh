@@ -9,6 +9,10 @@ METHOD="chacha20-ietf-poly1305"
 PASSWORD=""
 SERVER_IP=""
 ENABLE_UFW="auto"
+ENABLE_SUBSCRIPTION="yes"
+SUBSCRIPTION_PORT="18080"
+SUBSCRIPTION_TOKEN=""
+SUBSCRIPTION_DIR="/opt/clash-subscription"
 
 usage() {
   cat <<'EOF'
@@ -23,6 +27,10 @@ Optional:
   --method <METHOD>            Cipher method (default: chacha20-ietf-poly1305)
   --server-ip <IP>             Override server IP shown in output (default: auto detect)
   --enable-ufw <auto|yes|no>   Manage UFW rules for port (default: auto)
+  --enable-subscription <yes|no>
+                               Publish static Clash subscription (default: yes)
+  --subscription-port <PORT>   Subscription HTTP port (default: 18080)
+  --subscription-token <TOKEN> Fixed subscription token (default: auto detect or generate)
   -h, --help                   Show this help
 
 Example:
@@ -68,6 +76,18 @@ parse_args() {
         ENABLE_UFW="${2:-}"
         shift 2
         ;;
+      --enable-subscription)
+        ENABLE_SUBSCRIPTION="${2:-}"
+        shift 2
+        ;;
+      --subscription-port)
+        SUBSCRIPTION_PORT="${2:-}"
+        shift 2
+        ;;
+      --subscription-token)
+        SUBSCRIPTION_TOKEN="${2:-}"
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -98,6 +118,19 @@ parse_args() {
       exit 1
       ;;
   esac
+
+  case "${ENABLE_SUBSCRIPTION}" in
+    yes|no) ;;
+    *)
+      err "--enable-subscription must be one of: yes, no"
+      exit 1
+      ;;
+  esac
+
+  if ! [[ "${SUBSCRIPTION_PORT}" =~ ^[0-9]+$ ]] || (( SUBSCRIPTION_PORT < 1 || SUBSCRIPTION_PORT > 65535 )); then
+    err "Invalid --subscription-port: ${SUBSCRIPTION_PORT}"
+    exit 1
+  fi
 }
 
 install_packages() {
@@ -106,7 +139,7 @@ install_packages() {
   apt-get update -y
 
   log "Installing dependencies: shadowsocks-libev, jq, qrencode..."
-  apt-get install -y shadowsocks-libev jq qrencode curl
+  apt-get install -y shadowsocks-libev jq qrencode curl python3
 }
 
 write_config() {
@@ -154,6 +187,10 @@ configure_firewall() {
     log "Applying UFW rules for ${PORT}/tcp and ${PORT}/udp ..."
     ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
     ufw allow "${PORT}/udp" >/dev/null 2>&1 || true
+    if [[ "${ENABLE_SUBSCRIPTION}" == "yes" ]]; then
+      log "Applying UFW rule for subscription ${SUBSCRIPTION_PORT}/tcp ..."
+      ufw allow "${SUBSCRIPTION_PORT}/tcp" >/dev/null 2>&1 || true
+    fi
     ufw reload >/dev/null 2>&1 || true
   else
     log "UFW inactive, skip opening ports in UFW."
@@ -172,6 +209,31 @@ resolve_server_ip() {
 
   if [[ -z "${SERVER_IP}" ]]; then
     SERVER_IP="YOUR_SERVER_IP"
+  fi
+}
+
+resolve_subscription_token() {
+  local token_file
+
+  if [[ "${ENABLE_SUBSCRIPTION}" != "yes" ]]; then
+    return
+  fi
+
+  token_file="${SUBSCRIPTION_DIR}/.token"
+  mkdir -p "${SUBSCRIPTION_DIR}"
+
+  if [[ -n "${SUBSCRIPTION_TOKEN}" ]]; then
+    printf '%s\n' "${SUBSCRIPTION_TOKEN}" >"${token_file}"
+    return
+  fi
+
+  if [[ -f "${token_file}" ]]; then
+    SUBSCRIPTION_TOKEN="$(tr -d '\r\n' <"${token_file}")"
+  fi
+
+  if [[ -z "${SUBSCRIPTION_TOKEN}" ]]; then
+    SUBSCRIPTION_TOKEN="$(tr -d '-' </proc/sys/kernel/random/uuid)"
+    printf '%s\n' "${SUBSCRIPTION_TOKEN}" >"${token_file}"
   fi
 }
 
@@ -428,8 +490,65 @@ rules:
 EOF
 }
 
+publish_yaml() {
+  local yaml_path subscription_yaml_path
+
+  yaml_path="${HOME}/vpn.yaml"
+  generate_yaml >"${yaml_path}"
+  log "Clash YAML saved to ${yaml_path}"
+
+  if [[ "${ENABLE_SUBSCRIPTION}" != "yes" ]]; then
+    return
+  fi
+
+  mkdir -p "${SUBSCRIPTION_DIR}"
+  subscription_yaml_path="${SUBSCRIPTION_DIR}/${SUBSCRIPTION_TOKEN}.yaml"
+  generate_yaml >"${subscription_yaml_path}"
+  log "Subscription YAML published to ${subscription_yaml_path}"
+}
+
+configure_subscription_service() {
+  local unit_path
+
+  unit_path="/etc/systemd/system/clash-subscription.service"
+
+  if [[ "${ENABLE_SUBSCRIPTION}" != "yes" ]]; then
+    if systemctl list-unit-files | grep -q '^clash-subscription.service'; then
+      systemctl stop clash-subscription >/dev/null 2>&1 || true
+      systemctl disable clash-subscription >/dev/null 2>&1 || true
+    fi
+    return
+  fi
+
+  cat >"${unit_path}" <<EOF
+[Unit]
+Description=Static Clash Subscription Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${SUBSCRIPTION_DIR}
+ExecStart=/usr/bin/python3 -m http.server ${SUBSCRIPTION_PORT} --bind 0.0.0.0 --directory ${SUBSCRIPTION_DIR}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl restart clash-subscription
+  systemctl enable clash-subscription >/dev/null 2>&1 || true
+
+  if ! systemctl is-active --quiet clash-subscription; then
+    err "clash-subscription service is not active"
+    systemctl --no-pager --full status clash-subscription || true
+    exit 1
+  fi
+}
+
 print_result() {
-  local enc ss_uri
+  local enc ss_uri subscription_url
   if base64 --help 2>/dev/null | grep -q -- '-w'; then
     enc="$(printf '%s' "${METHOD}:${PASSWORD}" | base64 -w 0)"
   else
@@ -445,6 +564,13 @@ print_result() {
   echo "Port   : ${PORT}"
   echo "Method : ${METHOD}"
   echo "UDP    : true"
+  if [[ "${ENABLE_SUBSCRIPTION}" == "yes" ]]; then
+    subscription_url="http://${SERVER_IP}:${SUBSCRIPTION_PORT}/${SUBSCRIPTION_TOKEN}.yaml"
+    echo "SubSvc : enabled"
+    echo "SubURL : ${subscription_url}"
+  else
+    echo "SubSvc : disabled"
+  fi
   echo
   echo "SS URI:"
   echo "${ss_uri}"
@@ -462,19 +588,25 @@ EOF
   echo
   echo "Service status:"
   systemctl --no-pager --full status shadowsocks-libev | sed -n '1,18p'
+  if [[ "${ENABLE_SUBSCRIPTION}" == "yes" ]]; then
+    echo "Subscription service status:"
+    systemctl --no-pager --full status clash-subscription | sed -n '1,18p'
+  fi
   echo "Listening check:"
   ss -lunpt | grep ":${PORT}" || true
+  if [[ "${ENABLE_SUBSCRIPTION}" == "yes" ]]; then
+    ss -lnpt | grep ":${SUBSCRIPTION_PORT}" || true
+  fi
   echo "===================================================="
-
-  local yaml_path="${HOME}/vpn.yaml"
-  generate_yaml >"${yaml_path}"
-  log "Clash YAML saved to ${yaml_path}"
 
   echo
   echo "================ Clash YAML Config ================"
   generate_yaml
   echo "===================================================="
-  echo "Tip: YAML also saved to ${HOME}/vpn.yaml, copy it to your local machine and import into Clash."
+  echo "Tip: YAML saved to ${HOME}/vpn.yaml."
+  if [[ "${ENABLE_SUBSCRIPTION}" == "yes" ]]; then
+    echo "Tip: Use subscription URL in Clash: ${subscription_url}"
+  fi
   echo
 }
 
@@ -484,8 +616,11 @@ main() {
   install_packages
   write_config
   start_service
-  configure_firewall
   resolve_server_ip
+  resolve_subscription_token
+  publish_yaml
+  configure_subscription_service
+  configure_firewall
   print_result
 }
 

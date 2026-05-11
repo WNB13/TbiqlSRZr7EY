@@ -9,6 +9,7 @@
 - 自动设置开机自启
 - 可选处理 UFW 放行
 - 输出可直接用于 Clash 的完整 YAML 配置，并自动保存到服务器家目录的 `~/vpn.yaml`
+- 默认启动一个静态订阅服务，输出可直接用于 Clash 的订阅链接
 
 ## 0. 服务器一键部署（无需手动上传脚本）
 
@@ -24,7 +25,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/WNB13/TbiqlSRZr7EY/main/depl
 bash <(curl -fsSL https://raw.githubusercontent.com/WNB13/TbiqlSRZr7EY/main/deploy_ss_oneclick.sh) --password '你的强密码' --port 8443
 ```
 
-执行完毕后，终端会输出 SS URI 和可直接导入 Clash 的完整 YAML 配置，同时会在服务器家目录保存一份配置文件：`~/vpn.yaml`。
+执行完毕后，终端会输出 SS URI、静态订阅链接和可直接导入 Clash 的完整 YAML 配置，同时会在服务器家目录保存一份配置文件：`~/vpn.yaml`。
 
 ## 0.1 免责说明
 
@@ -64,18 +65,22 @@ sudo bash /root/deploy_ss_oneclick.sh --password '<你的强密码>'
 
 部署成功后，终端会输出：
 - SS URI
+- Clash 订阅链接
 - 完整 Clash YAML 配置
 - 服务状态摘要
 - 监听端口检查结果
 
 部署成功后，服务器上还会生成：
 - `~/vpn.yaml`：可直接下载到本地并导入 Clash 的完整配置文件
+- `/opt/clash-subscription/<token>.yaml`：用于订阅服务的静态配置文件
 
 如需下载到本地，可执行：
 
 ```bash
 scp root@<SERVER_IP>:~/vpn.yaml ./vpn.yaml
 ```
+
+如果直接用订阅方式，在 Clash 中填入脚本输出的订阅链接即可，无需手动下载文件。
 
 ## 3. 参数说明
 
@@ -88,6 +93,10 @@ Optional:
   --method <METHOD>            加密算法，默认 chacha20-ietf-poly1305
   --server-ip <IP>             指定输出中的服务器 IP（默认自动探测）
   --enable-ufw <auto|yes|no>   是否处理 UFW 规则，默认 auto
+  --enable-subscription <yes|no>
+                               是否启用静态订阅服务，默认 yes
+  --subscription-port <PORT>   订阅服务端口，默认 18080
+  --subscription-token <TOKEN> 固定订阅 token；不传则自动生成并持久化
   -h, --help                   查看帮助
 ```
 
@@ -117,6 +126,18 @@ sudo bash deploy_ss_oneclick.sh --password 'StrongPass_2026' --enable-ufw yes
 sudo bash deploy_ss_oneclick.sh --password 'StrongPass_2026' --server-ip 23.144.132.167
 ```
 
+### 4.5 自定义订阅端口和 token
+
+```bash
+sudo bash deploy_ss_oneclick.sh --password 'StrongPass_2026' --subscription-port 18080 --subscription-token myclashsubtoken
+```
+
+### 4.6 关闭订阅服务
+
+```bash
+sudo bash deploy_ss_oneclick.sh --password 'StrongPass_2026' --enable-subscription no
+```
+
 ## 5. 执行后验收
 
 在服务器执行：
@@ -131,7 +152,7 @@ ss -lunpt | grep ':443'
 - 看到 `0.0.0.0:443` 的 tcp/udp 监听（如果你改了端口则对应新端口）
 
 在客户端执行：
-- 直接导入脚本保存的 `~/vpn.yaml`，或复制终端输出的完整 YAML 到本地 `vpn.yaml`
+- 直接使用脚本输出的订阅链接，或导入脚本保存的 `~/vpn.yaml`
 - 启用 Clash 配置后访问 `https://ip.sb` 或 `https://ipinfo.io`
 - 出口 IP 应为服务器公网 IP
 
@@ -187,7 +208,47 @@ sudo bash deploy_ss_oneclick.sh --password '<密码>'
 3. 客户端节点参数是否与服务器一致（端口、算法、密码）
 4. 服务是否正常运行：`systemctl status shadowsocks-libev`
 
-### 8.3 UFW 未生效
+### 8.3 订阅链接无法访问
+
+依次检查：
+1. 云安全组是否放行订阅端口 TCP（默认 18080）
+2. 服务是否正常运行：`systemctl status clash-subscription`
+3. 端口是否监听：`ss -lnpt | grep ':18080'`
+4. 订阅文件是否存在：`ls -l /opt/clash-subscription/`
+
+### 8.4 忘记订阅链接如何找回
+
+可用以下任一方式找回：
+
+1. 读取 token 文件：
+
+```bash
+cat /opt/clash-subscription/.token
+```
+
+若输出为 `abc123xyz`，服务器 IP 为 `23.144.132.167`，订阅端口为默认 `18080`，则订阅链接为：
+
+```text
+http://23.144.132.167:18080/abc123xyz.yaml
+```
+
+2. 查看订阅目录中的 YAML 文件名：
+
+```bash
+ls -l /opt/clash-subscription/
+```
+
+目录中的 `<token>.yaml` 文件名就是订阅链接中的 token。
+
+3. 重新运行部署脚本：
+
+```bash
+sudo bash deploy_ss_oneclick.sh --password '<你的原密码>'
+```
+
+脚本会复用已保存的 token，并重新在终端输出订阅链接。
+
+### 8.5 UFW 未生效
 
 脚本默认 `auto` 模式：仅在 UFW 激活时写规则。可手动强制：
 
